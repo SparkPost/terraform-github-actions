@@ -4,7 +4,6 @@ source /usr/local/actions.sh
 
 debug
 setup
-init
 init-backend
 select-workspace
 set-plan-args
@@ -28,8 +27,8 @@ set -e
 
 cat "$PLAN_DIR/error.txt"
 
-if [[ "$GITHUB_EVENT_NAME" == "pull_request" || "$GITHUB_EVENT_NAME" == "issue_comment" || "$GITHUB_EVENT_NAME" == "pull_request_review_comment" ]]; then
-  if [[ "$INPUT_ADD_GITHUB_COMMENT" == "true" ]]; then
+if [[ "$GITHUB_EVENT_NAME" == "pull_request" || "$GITHUB_EVENT_NAME" == "issue_comment" || "$GITHUB_EVENT_NAME" == "pull_request_review_comment" || "$GITHUB_EVENT_NAME" == "pull_request_target" || "$GITHUB_EVENT_NAME" == "pull_request_review" ]]; then
+  if [[ "$INPUT_ADD_GITHUB_COMMENT" == "true" || "$INPUT_ADD_GITHUB_COMMENT" == "changes-only" ]]; then
 
     if [[ -z "$GITHUB_TOKEN" ]]; then
       echo "GITHUB_TOKEN environment variable must be set to add GitHub PR comments"
@@ -41,21 +40,27 @@ if [[ "$GITHUB_EVENT_NAME" == "pull_request" || "$GITHUB_EVENT_NAME" == "issue_c
     if [[ $TF_EXIT -eq 1 ]]; then
       STATUS="Failed to generate plan in $(job_markdown_ref)" github_pr_comment plan <"/$PLAN_DIR/error.txt"
     else
-      STATUS="Plan generated in $(job_markdown_ref)" github_pr_comment plan <"/$PLAN_DIR/plan.txt"
+
+      if [[ $TF_EXIT -eq 0 ]]; then
+        TF_CHANGES=false
+      else # [[ $TF_EXIT -eq 2 ]]
+        TF_CHANGES=true
+      fi
+
+      TF_CHANGES=$TF_CHANGES STATUS="Plan generated in $(job_markdown_ref)" github_pr_comment plan <"/$PLAN_DIR/plan.txt"
     fi
 
   fi
 
 else
-  debug_log "Not a pull_request, issue_comment or pull_request_review_comment event - not creating a PR comment"
+  debug_log "Not a pull_request, issue_comment, pull_request_target, pull_request_review or pull_request_review_comment event - not creating a PR comment"
 fi
 
 if [[ $TF_EXIT -eq 1 ]]; then
     debug_log "Error running terraform"
     exit 1
-fi
 
-if [[ $TF_EXIT -eq 0 ]]; then
+elif [[ $TF_EXIT -eq 0 ]]; then
     debug_log "No Changes to apply"
     echo "::set-output name=changes::false"
 
