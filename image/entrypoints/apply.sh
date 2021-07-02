@@ -91,7 +91,7 @@ if [[ "$INPUT_AUTO_APPROVE" == "true" || $PLAN_EXIT -eq 0 ]]; then
 
 else
 
-    if [[ "$GITHUB_EVENT_NAME" != "push" && "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_EVENT_NAME" != "issue_comment" && "$GITHUB_EVENT_NAME" != "pull_request_review_comment" ]]; then
+    if [[ "$GITHUB_EVENT_NAME" != "push" && "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_EVENT_NAME" != "issue_comment" && "$GITHUB_EVENT_NAME" != "pull_request_review_comment" && "$GITHUB_EVENT_NAME" != "pull_request_target" && "$GITHUB_EVENT_NAME" != "pull_request_review" ]]; then
         echo "Could not fetch plan from the PR - $GITHUB_EVENT_NAME event does not relate to a pull request. You can generate and apply a plan automatically by setting the auto_approve input to 'true'"
         exit 1
     fi
@@ -104,15 +104,23 @@ else
     fi
 
     if ! github_pr_comment get >"$PLAN_DIR/approved-plan.txt"; then
-        echo "Approved plan not found"
+        echo "Plan not found on PR"
+        echo "Generate the plan first using the dflook/terraform-plan action. Alternatively set the auto_approve input to 'true'"
+        echo "If dflook/terraform-plan was used with add_github_comment set to changes-only, this may mean the plan has since changed to include changes"
         exit 1
     fi
 
     if plan_cmp "$PLAN_DIR/plan.txt" "$PLAN_DIR/approved-plan.txt"; then
         apply
     else
-        debug_log diff "$PLAN_DIR/plan.txt" "$PLAN_DIR/approved-plan.txt"
+        echo "Not applying the plan - it has changed from the plan on the PR"
+        echo "The plan on the PR must be up to date. Alternatively, set the auto_approve input to 'true' to apply outdated plans"
         update_status "Plan not applied in $(job_markdown_ref) (Plan has changed)"
+
+        echo "Plan changes:"
+        debug_log diff "$PLAN_DIR/plan.txt" "$PLAN_DIR/approved-plan.txt"
+        diff "$PLAN_DIR/plan.txt" "$PLAN_DIR/approved-plan.txt" || true
+
         exit 1
     fi
 fi

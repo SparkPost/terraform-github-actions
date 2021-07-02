@@ -23,15 +23,49 @@ Retrieves the root-level outputs from a terraform remote state.
 
 * `backend_config`
 
-  Comma separated list of terraform backend config values.
+  List of terraform backend config values, one per line.
+
+  ```yaml
+  with:
+    backend_config: token=${{ secrets.BACKEND_TOKEN }}
+  ```
 
   - Type: string
   - Optional
 
 * `backend_config_file`
 
-  Comma separated list of terraform backend config files to use.
+  List of terraform backend config files to use, one per line.
   Paths should be relative to the GitHub Actions workspace
+
+  ```yaml
+  with:
+    backend_config_file: prod.backend.tfvars
+  ```
+
+  - Type: string
+  - Optional
+
+## Environment Variables
+
+* `TERRAFORM_CLOUD_TOKENS`
+
+  API tokens for terraform cloud hosts, of the form `<host>=<token>`. Multiple tokens may be specified, one per line.
+  These tokens may be used with the `remote` backend.
+
+  e.g for terraform cloud:
+  ```yaml
+  env:
+    TERRAFORM_CLOUD_TOKENS: app.terraform.io=${{ secrets.TF_CLOUD_TOKEN }}
+  ```
+
+  With Terraform Enterprise or other registries:
+  ```yaml
+  env:
+    TERRAFORM_CLOUD_TOKENS: |
+      app.terraform.io=${{ secrets.TF_CLOUD_TOKEN }}
+      terraform.example.com=${{ secrets.TF_REGISTRY_TOKEN }}
+  ```
 
   - Type: string
   - Optional
@@ -75,7 +109,10 @@ jobs:
         id: remote-state
         with:
           backend_type: s3
-          backend_config: bucket=terraform-github-actions,key=terraform-remote-state,region=eu-west-2
+          backend_config: |
+            bucket=terraform-github-actions
+            key=terraform-remote-state
+            region=eu-west-2
 
       - name: Send request
         run: |

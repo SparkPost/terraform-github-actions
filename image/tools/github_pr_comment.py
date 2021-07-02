@@ -4,13 +4,43 @@ import json
 import os
 import re
 import sys
+import datetime
+import hashlib
 from typing import Optional, Dict, Iterable
 
 import requests
 
 github = requests.Session()
-github.headers['authorization'] = f'Bearer {os.environ["GITHUB_TOKEN"]}'
+github.headers['authorization'] = f'token {os.environ["GITHUB_TOKEN"]}'
+github.headers['user-agent'] = 'terraform-github-actions'
+github.headers['accept'] = 'application/vnd.github.v3+json'
 
+def github_api_request(method, *args, **kw_args):
+    response = github.request(method, *args, **kw_args)
+
+    if response.status_code >= 400 and response.status_code < 500:
+        debug(str(response.headers))
+
+        try:
+            message = response.json()['message']
+
+            if response.headers['X-RateLimit-Remaining'] == '0':
+                limit_reset = datetime.datetime.fromtimestamp(int(response.headers['X-RateLimit-Reset']))
+                sys.stderr.write(message)
+                sys.stderr.write(f' Try again when the rate limit resets at {limit_reset} UTC.\n')
+                exit(1)
+
+            if message != 'Resource not accessible by integration':
+                sys.stderr.write(message)
+                sys.stderr.write('\n')
+                debug(response.content.decode())
+
+        except Exception:
+            sys.stderr.write(response.content.decode())
+            sys.stderr.write('\n')
+            raise
+
+    return response
 
 def debug(msg: str) -> None:
     for line in msg.splitlines():
@@ -21,7 +51,7 @@ def prs(repo: str) -> Iterable[Dict]:
     url = f'https://api.github.com/repos/{repo}/pulls'
 
     while True:
-        response = github.get(url, params={'state': 'all'})
+        response = github_api_request('get', url, params={'state': 'all'})
         response.raise_for_status()
 
         for pr in response.json():
@@ -47,7 +77,7 @@ def find_pr() -> str:
 
     event_type = os.environ['GITHUB_EVENT_NAME']
 
-    if event_type in ['pull_request', 'pull_request_review_comment']:
+    if event_type in ['pull_request', 'pull_request_review_comment', 'pull_request_target', 'pull_request_review']:
         return event['pull_request']['url']
 
     elif event_type == 'issue_comment':
@@ -71,47 +101,72 @@ def find_pr() -> str:
         raise Exception(f"The {event_type} event doesn\'t relate to a Pull Request.")
 
 def current_user() -> str:
-    response = github.get('https://api.github.com/user')
+
+    token_hash = hashlib.sha256(os.environ["GITHUB_TOKEN"].encode()).hexdigest()
+
+    try:
+        with open(f'.dflook-terraform/token-cache/{token_hash}') as f:
+            username = f.read()
+            debug(f'GITHUB_TOKEN username: {username}')
+            return username
+    except Exception as e:
+        debug(str(e))
+
+    response = github_api_request('get', 'https://api.github.com/user')
     if response.status_code != 403:
         user = response.json()
         debug('GITHUB_TOKEN user:')
         debug(json.dumps(user))
 
-        return user['login']
+        username = user['login']
+    else:
+        # Assume this is the github actions app token
+        username = 'github-actions[bot]'
 
-    # Assume this is the github actions app token
-    return 'github-actions[bot]'
+    try:
+        os.makedirs('.dflook-terraform/token-cache', exist_ok=True)
+        with open(f'.dflook-terraform/token-cache/{token_hash}', 'w') as f:
+            f.write(username)
+    except Exception as e:
+        debug(str(e))
+
+    debug(f'GITHUB_TOKEN username: {username}')
+    return username
 
 class TerraformComment:
     """
     The GitHub comment for this specific terraform plan
     """
 
-    def __init__(self, pr_url: str):
+    def __init__(self, pr_url: str=None):
         self._plan = None
         self._status = None
+        self._comment_url = None
 
-        response = github.get(pr_url)
+        if pr_url is None:
+            return
+
+        response = github_api_request('get', pr_url)
         response.raise_for_status()
 
         self._issue_url = response.json()['_links']['issue']['href'] + '/comments'
-        response = github.get(self._issue_url)
+        response = github_api_request('get', self._issue_url)
         response.raise_for_status()
 
-        self._comment_url = None
+        username = current_user()
+
         debug('Looking for an existing comment:')
         for comment in response.json():
             debug(json.dumps(comment))
-            if comment['user']['login'] == current_user():
-                match = re.match(rf'{re.escape(self._comment_identifier)}\n```(?:hcl)?(.*?)```(.*)', comment['body'], re.DOTALL)
+            if comment['user']['login'] == username:
+                match = re.match(rf'{re.escape(self._comment_identifier)}.*```(?:hcl)?(.*?)```.*', comment['body'], re.DOTALL)
 
                 if not match:
-                    match = re.match(rf'{re.escape(self._old_comment_identifier)}\n```(.*?)```(.*)', comment['body'], re.DOTALL)
+                    match = re.match(rf'{re.escape(self._old_comment_identifier)}\n```(.*?)```.*', comment['body'], re.DOTALL)
 
                 if match:
                     self._comment_url = comment['url']
                     self._plan = match.group(1).strip()
-                    self._status = match.group(2).strip()
                     return
 
     @property
@@ -135,6 +190,19 @@ class TerraformComment:
 
         if self.var_files:
             label += f'\nWith var files: `{self.var_files}`'
+
+        if self.variables:
+            stripped_vars = self.variables.strip()
+            if '\n' in stripped_vars:
+                label += f'''<details><summary>With variables</summary>
+
+```hcl
+{stripped_vars}
+```
+</details>
+'''
+            else:
+                label += f'\nWith variables: `{stripped_vars}`'
 
         return label
 
@@ -200,6 +268,10 @@ class TerraformComment:
         return os.environ.get('INPUT_BACKEND_CONFIG_FILE')
 
     @property
+    def variables(self) -> str:
+        return os.environ.get('INPUT_VARIABLES')
+
+    @property
     def vars(self) -> str:
         return os.environ.get('INPUT_VAR')
 
@@ -243,22 +315,80 @@ class TerraformComment:
     def status(self, status: str) -> None:
         self._status = status.strip()
 
-    def update_comment(self):
+    def body(self) -> str:
         body = f'{self._comment_identifier}\n```hcl\n{self.plan}\n```'
 
         if self.status:
             body += '\n' + self.status
 
+        return body
+
+    def collapsable_body(self) -> str:
+
+        try:
+            collapse_threshold = int(os.environ['TF_PLAN_COLLAPSE_LENGTH'])
+        except (ValueError, KeyError):
+            collapse_threshold = 10
+
+        open = ''
+        highlighting = ''
+
+        if self.plan.startswith('Error'):
+            open = ' open'
+        elif 'Plan:' in self.plan:
+            highlighting = 'hcl'
+            num_lines = len(self.plan.splitlines())
+            if num_lines < collapse_threshold:
+                open = ' open'
+
+        body = f'''{self._comment_identifier}
+<details{open}>
+  <summary>{self.summary()}</summary>
+
+```{highlighting}
+{self.plan}
+```
+</details>
+'''
+
+        if self.status:
+            body += '\n' + self.status
+
+        return body
+
+    def summary(self) -> str:
+        summary = None
+
+        for line in self.plan.splitlines():
+            if line.startswith('No changes') or line.startswith('Error'):
+                return line
+
+            if line.startswith('Plan:'):
+                summary = line
+
+            if line.startswith('Changes to Outputs'):
+                if summary:
+                    return summary + ' Changes to Outputs.'
+                else:
+                    return 'Changes to Outputs'
+
+        return summary
+
+    def update_comment(self, only_if_exists=False):
+        body = self.collapsable_body()
         debug(body)
 
         if self._comment_url is None:
+            if only_if_exists:
+                debug('Comment doesn\'t already exist - not creating it')
+                return
             # Create a new comment
             debug('Creating comment')
-            response = github.post(self._issue_url, json={'body': body})
+            response = github_api_request('post', self._issue_url, json={'body': body})
         else:
             # Update existing comment
             debug('Updating existing comment')
-            response = github.patch(self._comment_url, json={'body': body})
+            response = github_api_request('patch', self._comment_url, json={'body': body})
 
         debug(response.content.decode())
         response.raise_for_status()
@@ -273,10 +403,15 @@ if __name__ == '__main__':
     {sys.argv[0]} get >plan.txt''')
 
     tf_comment = TerraformComment(find_pr())
+    only_if_exists = False
 
     if sys.argv[1] == 'plan':
         tf_comment.plan = sys.stdin.read().strip()
         tf_comment.status = os.environ['STATUS']
+
+        if os.environ['INPUT_ADD_GITHUB_COMMENT'] == 'changes-only' and os.environ.get('TF_CHANGES', 'true') == 'false':
+            only_if_exists = True
+
     elif sys.argv[1] == 'status':
         if tf_comment.plan is None:
             exit(1)
@@ -286,5 +421,6 @@ if __name__ == '__main__':
         if tf_comment.plan is None:
             exit(1)
         print(tf_comment.plan)
+        exit(0)
 
-    tf_comment.update_comment()
+    tf_comment.update_comment(only_if_exists)
